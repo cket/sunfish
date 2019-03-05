@@ -74,31 +74,7 @@ for k, table in pst.items():
 # Our board is represented as a 120 character string. The padding allows for
 # fast detection of moves that don't stay within the board.
 A1, H1, A8, H8 = 91, 98, 21, 28
-initial = (
-    '         \n'  #   0 -  9
-    '         \n'  #  10 - 19
-    ' rnbqkbnr\n'  #  20 - 29
-    ' pppppppp\n'  #  30 - 39
-    ' ........\n'  #  40 - 49
-    ' ........\n'  #  50 - 59
-    ' ........\n'  #  60 - 69
-    ' ........\n'  #  70 - 79
-    ' PPPPPPPP\n'  #  80 - 89
-    ' RNBQKBNR\n'  #  90 - 99
-    '         \n'  # 100 -109
-    '         \n'  # 110 -119
-)
 
-# Lists of possible moves for each piece type.
-N, E, S, W = -10, 1, 10, -1
-directions = {
-    'P': (N, N+N, N+W, N+E),
-    'N': (N+N+E, E+N+E, E+S+E, S+S+E, S+S+W, W+S+W, W+N+W, N+N+W),
-    'B': (N+E, S+E, S+W, N+W),
-    'R': (N, E, S, W),
-    'Q': (N, E, S, W, N+E, S+E, S+W, N+W),
-    'K': (N, E, S, W, N+E, S+E, S+W, N+W)
-}
 
 # Mate value must be greater than 8*queen + 2*(rook+knight+bishop)
 # King value is set to twice this value such that if the opponent is
@@ -119,6 +95,122 @@ EVAL_ROUGHNESS = 20
 ###############################################################################
 # Chess logic
 ###############################################################################
+
+class Piece(object):
+
+    @staticmethod
+    def is_piece(string):
+        return string.isupper()
+
+    def __init__(self, piece_type, position):
+        """
+        representation of a piece on the board. Does not know about any other pieces on the board.
+        """
+        N, E, S, W = -10, 1, 10, -1
+        move_map = {
+            'P': (N, N+N, N+W, N+E),
+            'N': (N+N+E, E+N+E, E+S+E, S+S+E, S+S+W, W+S+W, W+N+W, N+N+W),
+            'B': (N+E, S+E, S+W, N+W),
+            'R': (N, E, S, W),
+            'Q': (N, E, S, W, N+E, S+E, S+W, N+W),
+            'K': (N, E, S, W, N+E, S+E, S+W, N+W)
+        }
+        self.allowed_moves = move_map[piece_type]
+        self.position = position
+        self.piece_type = piece_type
+
+    def get_allowed_moves(self):
+        """
+        Iterates over list of naive allowed moves without taking board position or other pieces into account
+        """
+        for move in self.allowed_moves:
+            yield move
+
+    def get_position(self):
+        return self.position
+
+    def is_pawn(self):
+        return self.piece_type == 'P'
+
+    def is_king(self):
+        return self.piece_type == 'K'
+
+    def is_knight(self):
+        return self.piece_type == 'N'
+
+
+class Board(object):
+
+    def __init__(self):
+        self.state = (
+            '         \n'  #   0 -  9
+            '         \n'  #  10 - 19
+            ' rnbqkbnr\n'  #  20 - 29
+            ' pppppppp\n'  #  30 - 39
+            ' ........\n'  #  40 - 49
+            ' ........\n'  #  50 - 59
+            ' ........\n'  #  60 - 69
+            ' ........\n'  #  70 - 79
+            ' PPPPPPPP\n'  #  80 - 89
+            ' RNBQKBNR\n'  #  90 - 99
+            '         \n'  # 100 -109
+            '         \n'  # 110 -119
+        )
+
+    def get_pieces(self):
+        for position, piece in enumerate(self.state):
+            if not Piece.is_piece(piece): continue
+            yield Piece(piece, position)
+
+    def attempt_to_move_piece(self, move, piece):
+        i = piece.get_position()
+        d = move
+        for j in count(i+d, d):
+            q = self.state[j]
+            # Stay inside the board, and off friendly pieces
+            if q.isspace() or q.isupper(): break
+            # Pawn move, double move and capture
+            if piece.is_pawn() and d in (N, N+N) and q != '.': break
+            if piece.is_pawn() and d == N+N and (i < A1+N or self.state[i+N] != '.'): break
+            if piece.is_pawn() and d in (N+W, N+E) and q == '.' and j not in (self.ep, self.kp): break
+            # Move it
+            yield (i, j)
+            # Stop crawlers from sliding, and sliding after captures
+            (if piece.is_pawn() or piece.is_king() or piece.is_knight()) or q.islower(): break
+            # Castling, by sliding the rook next to the king
+            if i == A1 and self.state[j+E] == 'K' and self.wc[0]: yield (j+E, j+W)
+            if i == H1 and self.state[j+W] == 'K' and self.wc[1]: yield (j+W, j+E)
+
+CastlingRights = namedtuple('CastlingRights', ['queen_side', 'king_side'])
+
+class BoardState(object):
+
+    def __init__(self, board, score, castling_rights, opponent_castling_rights, en_passant, king_passant):
+        """
+        A state of a chess game
+        board -- a 120 char representation of the board
+        score -- the board evaluation
+        wc -- the castling rights, [west/queen side, east/king side]
+        bc -- the opponent castling rights, [west/king side, east/queen side]
+        ep - the en passant square
+        kp - the king passant square
+        """
+        self.board = board
+        self.score = score
+        self.castling_rights = castling_rights
+        self.opponent_castling_rights = opponent_castling_rights
+        self.en_passant = en_passant
+        self.king_passant = king_passant
+
+    def gen_moves(self):
+        # For each of our pieces, iterate through each possible 'ray' of moves,
+        # as defined in the 'directions' map. The rays are broken e.g. by
+        # captures or immediately in case of pieces such as knights.
+        for piece in self.board.get_pieces():
+            for move in piece.get_allowed_moves():
+                self.board.attempt_to_move_piece(move, piece)
+
+
 
 class Position(namedtuple('Position', 'board score wc bc ep kp')):
     """ A state of a chess game
@@ -450,4 +542,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
