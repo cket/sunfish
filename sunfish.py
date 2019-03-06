@@ -98,10 +98,6 @@ EVAL_ROUGHNESS = 20
 
 class Piece(object):
 
-    @staticmethod
-    def is_piece(string):
-        return string.isupper()
-
     def __init__(self, piece_type, position):
         """
         representation of a piece on the board. Does not know about any other pieces on the board.
@@ -139,51 +135,75 @@ class Piece(object):
         return self.piece_type == 'N'
 
 
+class BoardSquare(object):
+
+    def __init__(self, string, position):
+        self.type = string
+        self.position = position
+
+    def is_friendly_piece(self):
+        return self.type.isupper()
+
+    def is_opponent_piece(self):
+        return self.type.islower()
+
+    def is_on_board(self):
+        return not self.type.isspace()
+
+    def is_empty(self):
+        return self.type == '.'
+
+    def get_position(self):
+        return self.position
+
+    def get_type(self):
+        return self.type
+
+    def to_piece(self):
+        return Piece(self.type, self.position)
+
 class Board(object):
 
-    def __init__(self):
-        self.state = (
-            '         \n'  #   0 -  9
-            '         \n'  #  10 - 19
-            ' rnbqkbnr\n'  #  20 - 29
-            ' pppppppp\n'  #  30 - 39
-            ' ........\n'  #  40 - 49
-            ' ........\n'  #  50 - 59
-            ' ........\n'  #  60 - 69
-            ' ........\n'  #  70 - 79
-            ' PPPPPPPP\n'  #  80 - 89
-            ' RNBQKBNR\n'  #  90 - 99
-            '         \n'  # 100 -109
-            '         \n'  # 110 -119
-        )
+    def __init__(self, initial_state=None):
+        if initial_state is None:
+            # TODO: explore replacing state with array of BoardSquares
+            self.state = (
+                '         \n'  #   0 -  9
+                '         \n'  #  10 - 19
+                ' rnbqkbnr\n'  #  20 - 29
+                ' pppppppp\n'  #  30 - 39
+                ' ........\n'  #  40 - 49
+                ' ........\n'  #  50 - 59
+                ' ........\n'  #  60 - 69
+                ' ........\n'  #  70 - 79
+                ' PPPPPPPP\n'  #  80 - 89
+                ' RNBQKBNR\n'  #  90 - 99
+                '         \n'  # 100 -109
+                '         \n'  # 110 -119
+            )
+        else:
+            self.state = initial_state
 
     def get_pieces(self):
-        for position, piece in enumerate(self.state):
-            if not Piece.is_piece(piece): continue
-            yield Piece(piece, position)
+        for position, square in enumerate(self.state):
+            square = BoardSquare(square, position)
+            if square.is_friendly_piece():
+                yield square.to_piece()
 
-    def attempt_to_move_piece(self, move, piece):
-        i = piece.get_position()
-        d = move
-        for j in count(i+d, d):
-            q = self.state[j]
-            # Stay inside the board, and off friendly pieces
-            if q.isspace() or q.isupper(): break
-            # Pawn move, double move and capture
-            if piece.is_pawn() and d in (N, N+N) and q != '.': break
-            if piece.is_pawn() and d == N+N and (i < A1+N or self.state[i+N] != '.'): break
-            if piece.is_pawn() and d in (N+W, N+E) and q == '.' and j not in (self.ep, self.kp): break
-            # Move it
-            yield (i, j)
-            # Stop crawlers from sliding, and sliding after captures
-            (if piece.is_pawn() or piece.is_king() or piece.is_knight()) or q.islower(): break
-            # Castling, by sliding the rook next to the king
-            if i == A1 and self.state[j+E] == 'K' and self.wc[0]: yield (j+E, j+W)
-            if i == H1 and self.state[j+W] == 'K' and self.wc[1]: yield (j+W, j+E)
+    def get_square(self, index):
+        return BoardSquare(self.state[index], index)
+
+    def rotate(self):
+        self.state=self.state[::-1].swapcase()
+
+    def put_square_at_position(self, square, position):
+        new_state = self.state[:position] + square.get_type() + self.state[position+1:]
+        self.state = new_state
+
 
 CastlingRights = namedtuple('CastlingRights', ['queen_side', 'king_side'])
 
-class BoardState(object):
+class GameState(object):
 
     def __init__(self, board, score, castling_rights, opponent_castling_rights, en_passant, king_passant):
         """
@@ -203,14 +223,117 @@ class BoardState(object):
         self.king_passant = king_passant
 
     def gen_moves(self):
-        # For each of our pieces, iterate through each possible 'ray' of moves,
-        # as defined in the 'directions' map. The rays are broken e.g. by
-        # captures or immediately in case of pieces such as knights.
         for piece in self.board.get_pieces():
             for move in piece.get_allowed_moves():
-                self.board.attempt_to_move_piece(move, piece)
+                # now that we know which ways the piece can theoretically move, lets see how they work on the board
+                yield self.get_legal_moves(move, piece)
 
+    def get_legal_moves(self, move, piece):
+        initial_position = piece.get_position()
+        for current_position in count(initial_position+move, move):
+            # now we are moving over the board, one movement length at a time. Peices that can only move a certain distance are covered by break statement at bottom
+            square = self.board.get_square()
+            if not square.is_on_board() or square.is_friendly_piece():
+                # Stay inside the board, and off friendly pieces
+                break
+            if piece.is_pawn():
+                if move in (N, N+N) and square.is_opponent_piece():
+                    # can't attack in while moving with pawn
+                    break
+                if move == N+N:
+                    if initial_position < A1+N or not self.board.get_square(initial_position+N).is_empty():
+                        # can't double move except in starting position, and can't double move over obstacle
+                        break
+                if move in (N+W, N+E):
+                    if square.is_empty() and current_position not in (self.en_passant, self.king_passant):
+                        # can't move diagonal into an empty square unless en passant
+                        break
+            # Move it
+            yield (initial_position, current_position)
 
+            if piece.is_pawn() or piece.is_king() or piece.is_knight()) or square.is_opponent_piece():
+                # Stop crawlers from sliding, and sliding after captures
+                break
+            # Castling, by sliding the rook next to the king
+            if initial_position == A1 and self.board.get_square(current_position+E).to_piece().is_king() and self.castling_rights[0]:
+                yield (j+E, j+W)
+            if initial_position == H1 and self.board.get_square(current_position+W).to_piece().is_king() and self.castling_rights[1]:
+                yield (j+W, j+E)
+
+    def rotate(self):
+        ''' Rotates the board, preserving enpassant '''
+        self.board.rotate()
+        return GameState(
+                          board=self.board,
+                          score=-self.score,
+                          castling_rights=self.opponent_castling_rights,
+                          opponent_castling_rights=self.castling_rights,
+                          en_passant=(119-self.ep if self.ep else 0),
+                          king_passant=(119-self.kp if self.kp else 0)
+                         )
+
+    def nullmove(self):
+        ''' Like rotate, but clears ep and kp '''
+        self.board.rotate()
+        return GameState(
+                          board=self.board,
+                          score=-self.score,
+                          castling_rights=self.opponent_castling_rights,
+                          opponent_castling_rights=self.castling_rights,
+                          en_passant=0,
+                          king_passant=0
+                         )
+
+    def move(self, move):
+        initial_position, end_position = move
+        i, j = initial_position, end_position
+        start_square, end_square = self.board.get_square(initial_position), self.board.get_square(end_position)
+        your_piece = start_square.to_piece()
+        # Copy variables and reset ep and kp
+        board = self.board
+        wc, bc, ep, kp = self.wc, self.bc, 0, 0
+        score = self.score + self.value(move)
+        # Actual move
+        self.board.put_square_at_position(square=start_square, position=end_position)
+        self.board.put_square_at_position(square=BoardSquare(type='.', position=initial_position), position=initial_position)
+        # Castling rights, we move the rook or capture the opponent's
+        if start_square.get_position() == A1:
+            self.castling_rights = (False, self.castling_rights[1])
+        if start_square.get_position() == H1:
+            self.castling_rights = (self.castling_rights[0], False)
+        if end_square.get_position() == A8:
+            self.opponent_castling_rights = (self.opponent_castling_rights[0], False)
+        if end_square.get_position() == H8:
+            self.opponent_castling_rights = (False, self.opponent_castling_rights[1])
+
+        if your_piece.is_king():
+            # if you moved the king always lose castling rights
+            self.castling_rights = (False, False)
+            if abs(end_square.get_position()-start_square.get_position()) == 2:
+                # now handle case where you actually just castled
+                kp = (start_square.get_position()+end_square.get_position())//2
+                if end_square.get_position() < start_square.get_position():
+                    self.board.put_square_at_position(square=BoardSquare(type='.', position=A1), position=A1)
+                else:
+                    self.board.put_square_at_position(square=BoardSquare(type='.', position=H1), position=H1)
+                self.board.put_square_at_position(square=BoardSquare(type='R', position=kp), position=kp)
+
+        if your_piece.is_pawn():
+            if A8 <= end_square.get_position() <= H8:
+                # always promote to queen
+                self.board.put_square_at_position(square=BoardSquare(type='Q', position=end_position), position=end_position)
+            if end_position - initial_position == 2*N:
+                # update en passant square if you do a double move
+                self.en_passant = initial_position + N
+            if end_position - initial_position in (N+W, N+E) and end_square.is_empty():
+                # if you just captured in passant, remove the captured peice
+                self.board.put_square_at_position(square=BoardSquare(type='.', position=end_position+S), position=end_position+S)
+        # We rotate the returned position, so it's ready for the next player
+        return self.rotate()
+
+    def value(self, move):
+        #TODO
+        pass
 
 class Position(namedtuple('Position', 'board score wc bc ep kp')):
     """ A state of a chess game
