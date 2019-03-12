@@ -286,7 +286,6 @@ class GameState(object):
 
     def move(self, move):
         initial_position, end_position = move
-        i, j = initial_position, end_position
         start_square, end_square = self.board.get_square(initial_position), self.board.get_square(end_position)
         your_piece = start_square.to_piece()
         # Copy variables and reset ep and kp
@@ -332,8 +331,29 @@ class GameState(object):
         return self.rotate()
 
     def value(self, move):
-        #TODO
-        pass
+        initial_position, end_position = move
+        start_square, end_square = self.board.get_square(initial_position), self.board.get_square(end_position)
+        # Actual move - pst is the array of points per piece type per position
+        score = pst[start_square.get_type()][end_position] - pst[start_square.get_type()][initial_position]
+        # Capture
+        if end_square.is_opponent_piece():
+            score += pst[end_square.get_type()][119-end_position]
+        # Castling check detection
+        if abs(end_position-self.king_passant) < 2:
+            score += pst['K'][119-end_position]
+
+        piece = start_square.to_piece()
+        # Castling
+        if piece.is_king() and abs(initial_position-end_position) == 2:
+            score += pst['R'][(initial_position+end_position)//2]
+            score -= pst['R'][A1 if end_position < initial_position else H1]
+        # Special pawn stuff
+        if piece.is_pawn():
+            if A8 <= end_position <= H8:
+                score += pst['Q'][end_position] - pst['P'][end_position]
+            if end_position == self.en_passant:
+                score += pst['P'][119-(end_position+S)]
+        return score
 
 class Position(namedtuple('Position', 'board score wc bc ep kp')):
     """ A state of a chess game
