@@ -298,7 +298,7 @@ class GameState(object):
 
     def move(self, move):
         """
-        so - we need to make a copy of the gamestate & make the move there. We want everything to be immutable.
+        Returns a copy of the gamestate, ready for opponents play, after making the move specified in the parameter.
         """
         initial_position, end_position = move
         start_square, end_square = self.board.get_square(initial_position), self.board.get_square(end_position)
@@ -359,6 +359,9 @@ class GameState(object):
         return game_state_after_move.rotate()
 
     def value(self, move):
+        """
+        Determines the worth of the specified move
+        """
         initial_position, end_position = move
         start_square, end_square = self.board.get_square(initial_position), self.board.get_square(end_position)
         # Actual move - pst is the array of points per piece type per position
@@ -413,127 +416,171 @@ class LRUCache:
 
 class Searcher:
     def __init__(self):
-        self.tp_score = LRUCache(TABLE_SIZE)
-        self.tp_move = LRUCache(TABLE_SIZE)
+        # cache of (gamestate, plies to search, boolean if the game node is root) to (lower score, upper score)
+        self.score_cache = LRUCache(TABLE_SIZE)
+        # cache of gamestate to best move to make
+        self.move_cache = LRUCache(TABLE_SIZE)
         self.nodes = 0
 
-    def bound(self, pos, gamma, depth, root=True):
-        """ returns r where
-                s(pos) <= r < gamma    if gamma > s(pos)
-                gamma <= r <= s(pos)   if gamma <= s(pos)"""
-        self.nodes += 1
+    def is_checkmated(self, gamestate):
+        """
+        Sunfish is a king-capture engine, so we should always check if we
+        still have a king. Notice since this is the only termination check,
+        the remaining code has to be comfortable with being mated, stalemated
+        or able to capture the opponent king.
+        """
+        return gamestate.score <= -MATE_LOWER
 
-        # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for calmness, and so there is no reason to keep different depths in the transposition table.
-        depth = max(depth, 0)
+    def get_cached_move(self, gamestate, boundary, depth, root):
+        """
+        Look in the table if we have already searched this position before.
+        We also need to be sure, that the stored search was over the same
+        nodes as the current search.
+        """
+        return self.score_cache.get((gamestate, depth, root), Entry(-MATE_UPPER, MATE_UPPER))
 
-        # Sunfish is a king-capture engine, so we should always check if we
-        # still have a king. Notice since this is the only termination check,
-        # the remaining code has to be comfortable with being mated, stalemated
-        # or able to capture the opponent king.
-        if pos.score <= -MATE_LOWER:
-            return -MATE_UPPER
+    def should_return_lower(self, entry, gamestate, boundary, depth, root):
+        if entry.lower >= boundary:
+            if (not root or self.move_cache.get(gamestate) is not None):
+                return True
 
-        # Look in the table if we have already searched this position before.
-        # We also need to be sure, that the stored search was over the same
-        # nodes as the current search.
-        entry = self.tp_score.get((pos, depth, root), Entry(-MATE_UPPER, MATE_UPPER))
-        if entry.lower >= gamma and (not root or self.tp_move.get(pos) is not None):
-            return entry.lower
-        if entry.upper < gamma:
-            return entry.upper
+    def should_return_upper(self, entry, gamestate, boundary, depth, root):
+        if entry.upper < boundary:
+            return True
 
-        # Here extensions may be added
-        # Such as 'if in_check: depth += 1'
+    def stalemate_handling(self, gamestate, target_score):
+        """
+        Stalemate checking is a bit tricky: Say we failed low, because
+        we can't (legally) move and so the (real) score is -infty.
+        At the next depth we are allowed to just return r, -infty <= r < boundary,
+        which is normally fine.
+        However, what if boundary = -10 and we don't have any legal moves?
+        Then the score is actaully a draw and we should fail high!
+        Thus, if target_score < boundary and target_score < 0 we need to double check what we are doing.
+        This doesn't prevent sunfish from making a move that results in stalemate,
+        but only if depth == 1, so that's probably fair enough.
+        (Btw, at depth 1 we can also mate without realizing.)
+        """
+        is_dead = lambda gamestate: any(gamestate.value(m) >= MATE_LOWER for m in gamestate.gen_moves())
+        if all(is_dead(gamestate.move(m)) for m in gamestate.gen_moves()):
+            in_check = is_dead(gamestate.nullmove())
+            target_score = -MATE_UPPER if in_check else 0
+        return target_score
 
-        # Generator of moves to search in order.
-        # This allows us to define the moves, but only calculate them if needed.
-        def moves():
-            # First try not moving at all
-            if depth > 0 and not root and any(c in pos.board.state for c in 'RBNQ'):
-                yield None, -self.bound(pos.nullmove(), 1-gamma, depth-3, root=False)
-            # For QSearch we have a different kind of null-move
-            if depth == 0:
-                yield None, pos.score
-            # Then killer move. We search it twice, but the tp will fix things for us. Note, we don't have to check for legality, since we've already done it before. Also note that in QS the killer must be a capture, otherwise we will be non deterministic.
-            killer = self.tp_move.get(pos)
-            if killer and (depth > 0 or pos.value(killer) >= QS_LIMIT):
-                yield killer, -self.bound(pos.move(killer), 1-gamma, depth-1, root=False)
-            # Then all the other moves
-            for move in sorted(pos.gen_moves(), key=pos.value, reverse=True):
-                if depth > 0 or pos.value(move) >= QS_LIMIT:
-                    yield move, -self.bound(pos.move(move), 1-gamma, depth-1, root=False)
-
-        # Run through the moves, shortcutting when possible
-        best = -MATE_UPPER
-        for move, score in moves():
-            best = max(best, score)
-            if best >= gamma:
-                # Save the move for pv construction and killer heuristic
-                self.tp_move[pos] = move
+    def search(self, gamestate, secs):
+        """
+        Returns the best calulated move and its score.
+        """
+        start = time.time()
+        for _ in self._search(gamestate):
+            if time.time() - start > secs:
                 break
+        # If the game hasn't finished we can retrieve our move from the
+        # transposition table.
+        return self.move_cache.get(gamestate), self.score_cache.get((gamestate, self.depth, True)).lower
 
-        # Stalemate checking is a bit tricky: Say we failed low, because
-        # we can't (legally) move and so the (real) score is -infty.
-        # At the next depth we are allowed to just return r, -infty <= r < gamma,
-        # which is normally fine.
-        # However, what if gamma = -10 and we don't have any legal moves?
-        # Then the score is actaully a draw and we should fail high!
-        # Thus, if best < gamma and best < 0 we need to double check what we are doing.
-        # This doesn't prevent sunfish from making a move that results in stalemate,
-        # but only if depth == 1, so that's probably fair enough.
-        # (Btw, at depth 1 we can also mate without realizing.)
-        if best < gamma and best < 0 and depth > 0:
-            is_dead = lambda pos: any(pos.value(m) >= MATE_LOWER for m in pos.gen_moves())
-            if all(is_dead(pos.move(m)) for m in pos.gen_moves()):
-                in_check = is_dead(pos.nullmove())
-                best = -MATE_UPPER if in_check else 0
+    def _search(self, gamestate):
+        """
+        Iterative deepening MTD-bi search
 
-        # Table part 2
-        if best >= gamma:
-            self.tp_score[(pos, depth, root)] = Entry(best, entry.upper)
-        if best < gamma:
-            self.tp_score[(pos, depth, root)] = Entry(entry.lower, best)
-
-        return best
-
-    # secs over maxn is a breaking change. Can we do this?
-    # I guess I could send a pull request to deep pink
-    # Why include secs at all?
-    def _search(self, pos):
-        """ Iterative deepening MTD-bi search """
+        References:
+        * https://en.wikipedia.org/wiki/Minimax
+        * https://en.wikipedia.org/wiki/MTD-f
+        """
         self.nodes = 0
 
         # In finished games, we could potentially go far enough to cause a recursion
         # limit exception. Hence we bound the ply.
         for depth in range(1, 1000):
             self.depth = depth
-            # The inner loop is a binary search on the score of the position.
+            print("Now searching the next %s possible moves" % depth)
+            # The inner loop is a binary search on the score of the game state.
             # Inv: lower <= score <= upper
             # 'while lower != upper' would work, but play tests show a margin of 20 plays better.
             lower, upper = -MATE_UPPER, MATE_UPPER
             while lower < upper - EVAL_ROUGHNESS:
-                gamma = (lower+upper+1)//2
-                score = self.bound(pos, gamma, depth)
-                if score >= gamma:
+                boundary = (lower+upper+1)//2
+                score = self.bound(gamestate, boundary, depth)
+                move = self.move_cache.get(gamestate)
+                if move:
+                    move = render(119-move[0]) + render(119-move[1])
+                print("Now aiming for scores between %s and %s - I have found a possible score of %s. The current best move is " % (lower, upper, score) + move)
+                if score >= boundary:
                     lower = score
-                if score < gamma:
+                if score < boundary:
                     upper = score
             # We want to make sure the move to play hasn't been kicked out of the table,
             # So we make another call that must always fail high and thus produce a move.
-            score = self.bound(pos, lower, depth)
+            score = self.bound(gamestate, lower, depth)
 
             # Yield so the user may inspect the search
             yield
 
-    def search(self, pos, secs):
-        start = time.time()
-        for _ in self._search(pos):
-            if time.time() - start > secs:
-                break
-        # If the game hasn't finished we can retrieve our move from the
-        # transposition table.
-        return self.tp_move.get(pos), self.tp_score.get((pos, self.depth, True)).lower
+    def bound(self, gamestate, boundary, plies, root=True):
+        """
+        gamestate
+        boundary: the threshold for success - if we can do better than this,
+        plies: number of half-turns to search ahead
+        root: is not a recursive call of this function
 
+        returns r where
+                gamestate.score <= r < boundary    if boundary > gamestate.score
+                boundary <= r <= gamestate.score   if boundary <= gamestate.score
+        """
+        self.nodes += 1
+
+        # Depth <= 0 is QSearch. Here any position is searched as deeply as is needed for calmness, and so there is no reason to keep different depths in the transposition table.
+        plies = max(plies, 0)
+
+        if self.is_checkmated(gamestate):
+            return -MATE_UPPER
+
+        entry = self.get_cached_move(gamestate, boundary, plies, root)
+        if self.should_return_lower(entry, gamestate, boundary, plies, root):
+            return entry.lower
+        elif self.should_return_upper(entry, gamestate, boundary, plies, root):
+            return entry.upper
+
+        # Run through the moves, shortcutting when possible
+        best = -MATE_UPPER
+        for move, score in self.moves(gamestate, boundary, plies, root):
+            best = max(best, score)
+            if best >= boundary:
+                # Save the move for pv construction and killer heuristic
+                self.move_cache[gamestate] = move
+                self.score_cache[(gamestate, plies, root)] = Entry(best, entry.upper)
+                break
+
+        if best < boundary and best < 0 and plies > 0:
+            best = self.stalemate_handling(gamestate, best)
+
+        if best < boundary:
+            self.score_cache[(gamestate, plies, root)] = Entry(entry.lower, best)
+
+        return best
+
+    def moves(self, gamestate, boundary, plies, root):
+        """
+        Generator of moves to search in order.
+        This allows us to define the moves, but only calculate them if needed.
+
+        In base case with plies = 1, finds the best move possible in the gamestate and returns it + the score
+        returns: best move, score that the move will yield
+        """
+        # First try not moving at all
+        if plies > 0 and not root and any(c in gamestate.board.state for c in 'RBNQ'):
+            yield None, -self.bound(gamestate.nullmove(), 1-boundary, plies-3, root=False)
+        # For QSearch we have a different kind of null-move
+        if plies == 0:
+            yield None, gamestate.score
+        # The best move found. Since this is just a cached move from the next for loop, it could be repeately yielded if does not satisfy boundary (not harmful). Note, we don't have to check for legality, since we've already done it before. Also note that in QS the killer must be a capture, otherwise we will be non deterministic.
+        killer = self.move_cache.get(gamestate)
+        if killer and (plies > 0 or gamestate.value(killer) >= QS_LIMIT):
+            yield killer, -self.bound(gamestate.move(killer), 1-boundary, plies-1, root=False)
+        # Then all the other moves
+        for move in sorted(gamestate.gen_moves(), key=gamestate.value, reverse=True):
+            if plies > 0 or gamestate.value(move) >= QS_LIMIT:
+                yield move, -self.bound(gamestate.move(move), 1-boundary, plies-1, root=False)
 
 ###############################################################################
 # User interface
@@ -559,17 +606,17 @@ def render(i):
     return chr(fil + ord('a')) + str(-rank + 1)
 
 
-def print_pos(pos):
+def print_pos(gamestate):
     print()
     uni_pieces = {'R':'♜', 'N':'♞', 'B':'♝', 'Q':'♛', 'K':'♚', 'P':'♟',
                   'r':'♖', 'n':'♘', 'b':'♗', 'q':'♕', 'k':'♔', 'p':'♙', '.':'·'}
-    for i, row in enumerate(pos.board.state.split()):
+    for i, row in enumerate(gamestate.board.state.split()):
         print(' ', 8-i, ' '.join(uni_pieces.get(p, p) for p in row))
     print('    a b c d e f g h \n\n')
 
 
 def main():
-    pos = GameState(board=Board(),
+    gamestate = GameState(board=Board(),
                     score=0,
                     castling_rights=(True,True),
                     opponent_castling_rights=(True,True),
@@ -578,33 +625,35 @@ def main():
                     )
     searcher = Searcher()
     while True:
-        print_pos(pos)
+        print_pos(gamestate)
 
-        if pos.score <= -MATE_LOWER:
+        if gamestate.score <= -MATE_LOWER:
             print("You lost")
             break
 
         # We query the user until she enters a (pseudo) legal move.
         move = None
-        while move not in pos.gen_moves():
+        while move not in gamestate.gen_moves():
             match = re.match('([a-h][1-8])'*2, input('Your move: '))
             if match:
                 move = parse(match.group(1)), parse(match.group(2))
             else:
                 # Inform the user when invalid input (e.g. "help") is entered
                 print("Please enter a move like g8f6")
-        pos = pos.move(move)
+        value = gamestate.value(move)
+        gamestate = gamestate.move(move)
+        print("Your Score: %s - that move's value was %s" % (0-gamestate.score, value))
 
         # After our move we rotate the board and print it again.
         # This allows us to see the effect of our move.
-        print_pos(pos.rotate())
+        print_pos(gamestate.rotate())
 
-        if pos.score <= -MATE_LOWER:
+        if gamestate.score <= -MATE_LOWER:
             print("You won")
             break
 
         # Fire up the engine to look for a move.
-        move, score = searcher.search(pos, secs=2)
+        move, score = searcher.search(gamestate, secs=4)
 
         if score == MATE_UPPER:
             print("Checkmate!")
@@ -612,7 +661,9 @@ def main():
         # The black player moves from a rotated position, so we have to
         # 'back rotate' the move before printing it.
         print("My move:", render(119-move[0]) + render(119-move[1]))
-        pos = pos.move(move)
+        value = gamestate.value(move)
+        gamestate = gamestate.move(move)
+        print("My Score: %s - that move's value was %s" % (0-gamestate.score, value))
 
 
 if __name__ == '__main__':
