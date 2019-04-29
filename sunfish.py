@@ -614,6 +614,18 @@ def print_pos(gamestate):
         print(' ', 8-i, ' '.join(uni_pieces.get(p, p) for p in row))
     print('    a b c d e f g h \n\n')
 
+def test_moves(game_plan=False):
+    return game_plan
+
+
+game_plan=[]
+def get_user_input(text):
+    global game_plan
+    if test_moves() and not game_plan:
+        game_plan = test_moves()
+    if game_plan:
+        return game_plan.pop(0)
+    return input(text)
 
 def main():
     gamestate = GameState(board=Board(),
@@ -634,7 +646,7 @@ def main():
         # We query the user until she enters a (pseudo) legal move.
         move = None
         while move not in gamestate.gen_moves():
-            match = re.match('([a-h][1-8])'*2, input('Your move: '))
+            match = re.match('([a-h][1-8])'*2, get_user_input('Your move: '))
             if match:
                 move = parse(match.group(1)), parse(match.group(2))
             else:
